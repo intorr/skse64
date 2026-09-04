@@ -1,5 +1,5 @@
 #include "skse64/Serialization.h"
-#include "common/IFileStream.h"
+#include "common/IMemoryFileStream.h"
 #include "skse64/PluginManager.h"
 #include "GameAPI.h"
 #include "skse64_common/skse_version.h"
@@ -56,7 +56,7 @@ namespace Serialization
 	// locals
 
 	std::string		s_savePath;
-	IFileStream		s_currentFile;
+	IMemoryFileStream	s_currentFile;
 
 	typedef std::vector <PluginCallbacks>	PluginCallbackList;
 	PluginCallbackList	s_pluginCallbacks;
