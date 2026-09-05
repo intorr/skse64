@@ -31,6 +31,11 @@ void LoadModList(SKSESerializationInterface * intfc)
 	for (UInt32 i = 0; i < numSavedMods; i++)
 	{
 		intfc->ReadRecordData(&nameLen, sizeof(nameLen));
+		if (nameLen >= sizeof(name))
+		{
+			_ERROR("LoadModList: corrupt mod list (name length %u > max %u); aborting load", (unsigned)nameLen, (unsigned)sizeof(name));
+			return;
+		}
 		intfc->ReadRecordData(&name, nameLen);
 		name[nameLen] = 0;
 
@@ -121,6 +126,11 @@ void LoadPluginList(SKSESerializationInterface * intfc)
 		}
 
 		intfc->ReadRecordData(&nameLen, sizeof(nameLen));
+		if (nameLen >= sizeof(name))
+		{
+			_ERROR("LoadPluginList: corrupt mod list (name length %u > max %u); aborting load", (unsigned)nameLen, (unsigned)sizeof(name));
+			return;
+		}
 		intfc->ReadRecordData(&name, nameLen);
 		name[nameLen] = 0;
 
@@ -177,6 +187,11 @@ void LoadLightModList(SKSESerializationInterface * intfc, UInt32 version)
 	for (UInt32 i = 0; i < numSavedMods; i++)
 	{
 		intfc->ReadRecordData(&nameLen, sizeof(nameLen));
+		if (nameLen >= sizeof(name))
+		{
+			_ERROR("LoadLightModList: corrupt mod list (name length %u > max %u); aborting load", (unsigned)nameLen, (unsigned)sizeof(name));
+			return;
+		}
 		intfc->ReadRecordData(&name, nameLen);
 		name[nameLen] = 0;
 

@@ -1,14 +1,13 @@
 #include "skse64/Serialization.h"
+
 #include "common/IMemoryFileStream.h"
-#include "skse64/PluginManager.h"
-#include "GameAPI.h"
-#include "skse64_common/skse_version.h"
-#include <vector>
-#include <shlobj.h>
-#include "GameData.h"
-#include "skse64/InternalSerialization.h"
 #include "skse64/GameSettings.h"
-#include "skse64/ScaleformCallbacks.h"
+#include "skse64/InternalSerialization.h"
+#include "skse64/ScaleformValue.h"
+#include "skse64_common/skse_version.h"
+
+#include <shlobj.h>
+#include <vector>
 
 namespace Serialization
 {
@@ -61,6 +60,10 @@ namespace Serialization
 	typedef std::vector <PluginCallbacks>	PluginCallbackList;
 	PluginCallbackList	s_pluginCallbacks;
 
+	// handle of the plugin whose save handler is currently running (assigned in
+	// HandleSaveGlobalData); never read anywhere -- dead state kept as a hook
+	// for future per-plugin diagnostics (e.g. naming the offending plugin in
+	// error logs); delete it and the assignment if it stays unused
 	PluginHandle	s_currentPlugin = 0;
 
 	Header			s_fileHeader = { 0 };
@@ -71,6 +74,12 @@ namespace Serialization
 	bool			s_chunkOpen = false;
 	UInt64			s_chunkHeaderOffset = 0;
 	ChunkHeader		s_chunkHeader = { 0 };
+
+	// end offset of the plugin data region currently being loaded; the record
+	// readers (GetNextRecordInfo / ReadRecordData) are clamped to it so a corrupt
+	// chunk can't run off the end of the in-memory image and trip
+	// IMemoryFileStream's fatal read-past-end assert
+	UInt64			s_pluginRegionEnd = 0;
 
 	// utilities
 
@@ -113,7 +122,7 @@ namespace Serialization
 			{
 				UInt32	collidingID = iter - s_pluginCallbacks.begin();
 
-				_ERROR("plugin serialization UID collision (uid = %08X, plugins = %d %d)", plugin, uid, collidingID);
+				_ERROR("plugin serialization UID collision (uid = %08X, plugins = %d %d)", uid, plugin, collidingID);
 			}
 		}
 
@@ -250,6 +259,11 @@ namespace Serialization
 		if(!s_pluginHeader.numChunks)
 			return false;
 
+		// a bogus record count could ask for a header past the plugin's validated
+		// region; refuse it instead of reading off the end of the image
+		if((UInt64)s_currentFile.GetOffset() + sizeof(s_chunkHeader) > s_pluginRegionEnd)
+			return false;
+
 		s_pluginHeader.numChunks--;
 
 		s_currentFile.ReadBuf(&s_chunkHeader, sizeof(s_chunkHeader));
@@ -270,7 +284,16 @@ namespace Serialization
 		if(length > s_chunkHeader.length)
 			length = s_chunkHeader.length;
 
-		s_currentFile.ReadBuf(buf, length);
+		// clamp to the validated plugin region so a corrupt chunk length can't
+		// run off the end of the image (which would trip the fatal assert); a
+		// clamped read returns fewer bytes and the caller treats it as a failure
+		UInt64	curOffset = (UInt64)s_currentFile.GetOffset();
+		UInt64	remain = (curOffset < s_pluginRegionEnd) ? (s_pluginRegionEnd - curOffset) : 0;
+		if((UInt64)length > remain)
+			length = (UInt32)remain;
+
+		if(length)
+			s_currentFile.ReadBuf(buf, length);
 
 		s_chunkHeader.length -= length;
 
@@ -345,13 +368,40 @@ namespace Serialization
 	{
 		_MESSAGE("creating co-save");
 
-		DeleteFile(s_savePath.c_str());
-
-		if(!s_currentFile.Create(s_savePath.c_str()))
+		if(s_savePath.empty())
 		{
-			_ERROR("HandleSaveGlobalData: couldn't create save file (%s)", s_savePath.c_str());
+			_ERROR("HandleSaveGlobalData: no save path set");
 			return;
 		}
+
+		// Build the co-save in a temporary file, then atomically rename it into
+		// place on success. The previous .skse is only replaced once the whole
+		// new file is committed: if saving fails or is interrupted, the old
+		// .skse stays intact (only the temp file, removed below, is affected).
+		// The ".skse" extension is swapped for ".tmp" instead of appended, so
+		// the temp path is never longer than the final one (MAX_PATH edge).
+		// "-5" assumes the path ends in ".skse" -- always true, since SetSaveName
+		// is the only writer of s_savePath and appends that extension; guard it so
+		// a future extension change is caught in debug instead of silently
+		// producing a wrong temp path.
+		ASSERT(s_savePath.size() >= 5 && _stricmp(s_savePath.c_str() + s_savePath.size() - 5, ".skse") == 0);
+
+		std::string	tempPath = s_savePath.substr(0, s_savePath.size() - 5) + ".tmp";
+
+		DeleteFile(tempPath.c_str());
+
+		// create is in-memory: it flushes any still-pending image from a prior
+		// save before starting. A failed save discards its image (the cleanup
+		// below), so this is only reachable if that flush keeps failing (disk
+		// error); the save aborts with the old .skse intact. Other disk errors
+		// surface through Close() below (saveSucceeded)
+		if(!s_currentFile.Create(tempPath.c_str()))
+		{
+			_ERROR("HandleSaveGlobalData: couldn't create save file (%s), a previous flush is still failing", tempPath.c_str());
+			return;
+		}
+
+		bool	saveSucceeded = false;
 
 		try
 		{
@@ -380,6 +430,8 @@ namespace Serialization
 
 					s_chunkOpen = false;
 
+					bool	pluginSaveFailed = false;
+
 					// call the plugin
 					try
 					{
@@ -387,7 +439,34 @@ namespace Serialization
 					}
 					catch( ... )
 					{
-						_ERROR("HandleSaveGlobalData: exception occurred saving %08X at %016I64X data may be corrupt.", s_pluginHeader.signature, s_currentFile.GetOffset());
+						// the offset is kept so a mod author can locate where the
+						// plugin's save handler blew up
+						_ERROR("HandleSaveGlobalData: exception occurred saving %08X at offset %016I64X, discarding that plugin's last record; its data may be corrupt", s_pluginHeader.signature, s_currentFile.GetOffset());
+						pluginSaveFailed = true;
+					}
+
+					if(pluginSaveFailed && s_chunkOpen)
+					{
+						// drop the incomplete chunk that was open when the plugin
+						// threw (its header/data was never flushed); keep any
+						// chunks the plugin fully wrote
+						UInt64	partialSize = s_currentFile.GetOffset() - s_chunkHeaderOffset - sizeof(s_chunkHeader);
+
+						_MESSAGE("HandleSaveGlobalData: discarding incomplete record from %08X (type %08X version %u, %u bytes written)", s_pluginHeader.signature, s_chunkHeader.type, s_chunkHeader.version, (UInt32)partialSize);
+
+						s_currentFile.SetLength(s_chunkHeaderOffset);
+						s_pluginHeader.numChunks--;
+						s_chunkOpen = false;
+
+						if(!s_pluginHeader.numChunks)
+						{
+							// the dropped chunk was this plugin's first record:
+							// also remove the reserved (never filled) 12-byte
+							// plugin header, otherwise a zeroed phantom header
+							// is committed and every load warns about a
+							// "plugin with signature 00000000"
+							s_currentFile.SetLength(s_pluginHeaderOffset);
+						}
 					}
 
 					// flush the remaining chunk data
@@ -410,13 +489,45 @@ namespace Serialization
 			// write header
 			s_currentFile.SetOffset(0);
 			s_currentFile.WriteBuf(&s_fileHeader, sizeof(s_fileHeader));
+
+			// flush the temporary file; reports whether the write to disk succeeded
+			saveSucceeded = s_currentFile.Close();
+
+			if(!saveSucceeded)
+				_ERROR("HandleSaveGlobalData: failed to write the co-save to disk; plugin data was NOT saved (%s)", tempPath.c_str());
 		}
 		catch(...)
 		{
-			_ERROR("HandleSaveGame: exception during save");
+			_ERROR("HandleSaveGlobalData: exception during save (outside a plugin handler)");
 		}
 
-		s_currentFile.Close();
+		if(saveSucceeded)
+		{
+			// atomically replace the real co-save with the fully-written temp file
+			if(!MoveFileExA(tempPath.c_str(), s_savePath.c_str(), MOVEFILE_REPLACE_EXISTING))
+			{
+				_ERROR("HandleSaveGlobalData: couldn't commit save file (%s), error %u", tempPath.c_str(), GetLastError());
+				saveSucceeded = false;
+			}
+		}
+
+		if(!saveSucceeded)
+		{
+			// drop the in-memory image on any failure. On a failed flush it still
+			// holds the whole (stale) co-save, and leaving it dirty would make a
+			// later save -- possibly of a differently-named slot -- flush it to
+			// its own temp path as an orphan. After a failed move the image is
+			// already clean, so this is a no-op there.
+			s_currentFile.Discard();
+
+			if(!DeleteFile(tempPath.c_str()))
+			{
+				UInt32	err = (UInt32)GetLastError();
+
+				if(err != ERROR_FILE_NOT_FOUND)
+					_WARNING("HandleSaveGlobalData: could not remove temp file (%s), error %u", tempPath.c_str(), err);
+			}
+		}
 	}
 
 	void HandleLoadGlobalData(void)
@@ -425,12 +536,34 @@ namespace Serialization
 
 		if(!s_currentFile.Open(s_savePath.c_str()))
 		{
+			// no co-save yet (first load) or the file couldn't be read; either
+			// way there is nothing to load, so skip without disturbing the game
+			_MESSAGE("HandleLoadGlobalData: co-save not loaded (%s)", s_savePath.c_str());
 			return;
 		}
 
 		try
 		{
+			// reset per-load state left over from an earlier load in this session.
+			// the no-data dispatch below bounds record reads against
+			// s_pluginRegionEnd and s_pluginHeader.numChunks; if those retained
+			// values from a previous (larger) co-save, a data-less plugin would be
+			// handed phantom records, or a read could run off the end of a smaller
+			// image and trip the fatal assert
+			s_pluginHeader = { 0 };
+			s_pluginRegionEnd = 0;
+			s_chunkOpen = false;
+
 			Header	header;
+
+			// a co-save shorter than its own header cannot be parsed; abort here
+			// rather than in the ReadBuf below, which would run off the end of the
+			// in-memory image and trip its fatal assert
+			if(s_currentFile.GetRemain() < (SInt64)sizeof(header))
+			{
+				_ERROR("HandleLoadGame: co-save is %u bytes but needs %u for its header; aborting load", (UInt32)s_currentFile.GetRemain(), (UInt32)sizeof(header));
+				goto done;
+			}
 
 			s_currentFile.ReadBuf(&header, sizeof(header));
 
@@ -462,6 +595,28 @@ namespace Serialization
 				s_currentFile.ReadBuf(&s_pluginHeader, sizeof(s_pluginHeader));
 
 				UInt64	pluginChunkStart = s_currentFile.GetOffset();
+
+				// the plugin's declared data length must fit in the file: a bogus
+				// value would position the stream past the end (or let a record
+				// read run off the image into its fatal assert). The stream is
+				// corrupt from here, so stop loading further plugins
+				if(pluginChunkStart + s_pluginHeader.length > (UInt64)s_currentFile.GetLength())
+				{
+					_ERROR("HandleLoadGame: plugin %08X claims %u bytes past the end of the co-save; stopping", s_pluginHeader.signature, s_pluginHeader.length);
+
+					// the no-data dispatch below still sees this header; drop
+					// its chunk count, otherwise a stale count (with a stale
+					// s_pluginRegionEnd left over from an earlier load in the
+					// session) hands phantom records to plugins that had no
+					// data in this file
+					s_pluginHeader.numChunks = 0;
+					break;
+				}
+
+				// bound this plugin's record reads to its validated region so a
+				// corrupt chunk (see GetNextRecordInfo / ReadRecordData) degrades to
+				// a stopped load instead of tripping the image's fatal assert
+				s_pluginRegionEnd = pluginChunkStart + s_pluginHeader.length;
 
 				UInt32	pluginIdx = kPluginHandle_Invalid;
 
@@ -505,15 +660,33 @@ namespace Serialization
 			// call load on plugins that had no data
 			for(PluginCallbackList::iterator iter = s_pluginCallbacks.begin(); iter != s_pluginCallbacks.end(); ++iter) {
 				if(!iter->hadData && iter->load) {
-					iter->load(&g_SKSESerializationInterface);
+					// drop a record the previous (data) plugin may have left open:
+					// without this, the first GetNextRecordInfo below would run
+					// FlushReadRecord() and Skip() the stale s_chunkHeader.length
+					// from a stream offset that is already at the end of the data,
+					// pushing it past the end of the image
+					s_chunkOpen = false;
+
+					// isolate this plugin the same way as the data loop above: a
+					// throw in its reset-to-defaults path must not abort the
+					// loads of the remaining plugins
+					try
+					{
+						iter->load(&g_SKSESerializationInterface);
+					}
+					catch(...)
+					{
+						_ERROR("HandleLoadGame: exception occurred (no-data) loading %08X", iter->uid);
+					}
 				}
 			}
 		}
 		catch(...)
 		{
-			_ERROR("HandleLoadGame: exception during load");
-
-			// ### this could be handled better, individually catch around each plugin so one plugin can't mess things up for everyone else
+			// last-resort guard: every plugin load is already isolated above (data
+			// loop and no-data loop), so this only catches an unexpected throw
+			// outside a plugin handler; the stream is still closed via done:
+			_ERROR("HandleLoadGame: exception during load (outside a plugin handler)");
 		}
 
 	done:
@@ -559,13 +732,13 @@ namespace Serialization
 		char buf[257] = { 0 };
 		UInt16 len = 0;
 
-		if (! intfc->ReadRecordData(&len, sizeof(len)))
+		if (intfc->ReadRecordData(&len, sizeof(len)) != sizeof(len))
 			return false;
 
 		if (len > 256)
 			return false;
 
-		if (! intfc->ReadRecordData(buf, len))
+		if (intfc->ReadRecordData(buf, len) != len)
 			return false;
 
 		*str = BSFixedString(buf);
@@ -575,9 +748,14 @@ namespace Serialization
 	template <>
 	bool WriteData<std::string>(SKSESerializationInterface * intfc, const std::string * str)
 	{
-		UInt16 len = str->length();
-		if (len > 256)
+		// check the length before narrowing to UInt16: a string longer than
+		// 65535 would otherwise wrap (e.g. 65536 -> 0) and silently write a
+		// short/empty payload that returns "success"
+		size_t totalLen = str->length();
+		if (totalLen > 256)
 			return false;
+
+		UInt16 len = (UInt16)totalLen;
 
 		if (! intfc->WriteRecordData(&len, sizeof(len)))
 			return false;
@@ -592,13 +770,13 @@ namespace Serialization
 		char buf[257] = { 0 };
 		UInt16 len = 0;
 
-		if (! intfc->ReadRecordData(&len, sizeof(len)))
+		if (intfc->ReadRecordData(&len, sizeof(len)) != sizeof(len))
 			return false;
 
 		if (len > 256)
 			return false;
 
-		if (! intfc->ReadRecordData(buf, len))
+		if (intfc->ReadRecordData(buf, len) != len)
 			return false;
 
 		*str = std::string(buf);
@@ -608,9 +786,14 @@ namespace Serialization
 	template <>
 	bool WriteData<const char>(SKSESerializationInterface * intfc, const char* str)
 	{
-		UInt16 len = strlen(str);
-		if (len > 256)
+		// check the length before narrowing to UInt16: a string longer than
+		// 65535 would otherwise wrap (e.g. 65536 -> 0) and silently write a
+		// short/empty payload that returns "success"
+		size_t totalLen = strlen(str);
+		if (totalLen > 256)
 			return false;
+
+		UInt16 len = (UInt16)totalLen;
 
 		if (! intfc->WriteRecordData(&len, sizeof(len)))
 			return false;
@@ -623,6 +806,29 @@ namespace Serialization
 	bool WriteData<GFxValue>(SKSESerializationInterface* intfc, const GFxValue* val)
 	{
 		UInt32 type = val->GetType();
+
+		// validate the variant BEFORE committing the 4-byte type tag, so a logical
+		// write failure (an unsupported type, or a string too long to serialize)
+		// leaves no orphan tag in the open chunk for the reader to choke on: the
+		// read side consumes the tag first, then fails on the missing/short payload
+		// (a torn record)
+		switch (type)
+		{
+		case GFxValue::kType_Bool:
+		case GFxValue::kType_Number:
+			break; // fixed-width, always writable
+		case GFxValue::kType_String:
+		{
+			const char * s = val->GetString();
+			if (!s || strlen(s) > 256)
+				return false;
+			break;
+		}
+		default:
+			// Unsupported
+			return false;
+		}
+
 		if (! WriteData(intfc, &type))
 			return false;
 
@@ -640,15 +846,11 @@ namespace Serialization
 		}
 		case GFxValue::kType_String:
 		{
-			const char* t = val->GetString();
-			return WriteData<const char>(intfc, t);
+			return WriteData<const char>(intfc, val->GetString());
 		}
 		default:
-			// Unsupported
-			return false;
+			return false; // unreachable (validated above)
 		}
-
-		return false;
 	}
 
 	template <>
