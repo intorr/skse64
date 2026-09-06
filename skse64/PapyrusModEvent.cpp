@@ -166,7 +166,7 @@ namespace
 					return false;
 				break;
 			case Argument::kType_String:
-				if (! WriteData(intfc, &e.data.str))
+				if (! WriteData<const char>(intfc, e.data.str))
 					return false;
 				break;
 			case Argument::kType_Form:
@@ -211,9 +211,13 @@ namespace
 					return false;
 				break;
 			case Argument::kType_String:
-				if (! ReadData(intfc, &e.data.str))
+			{
+				BSFixedString str;
+				if (! ReadData(intfc, &str))
 					return false;
-				break;
+				e.data.str = str;
+			}
+			break;
 			case Argument::kType_Form:
 			{
 				UInt32 formId;
